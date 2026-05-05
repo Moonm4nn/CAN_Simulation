@@ -1,0 +1,37 @@
+# Build outputs
+build/
+Debug/
+Release/
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.o
+*.d
+*.a
+
+# STM32CubeIDE / Eclipse metadata
+.metadata/
+.settings/
+*.launch
+
+# VS Code local settings
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Python/cache/tools
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak

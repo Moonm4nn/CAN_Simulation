@@ -1,0 +1,29 @@
+# Normalize text files in the repo
+* text=auto
+
+# C/C++/header files should use LF in repo
+*.c text eol=lf
+*.h text eol=lf
+*.s text eol=lf
+*.ld text eol=lf
+*.ioc text eol=lf
+*.mxproject text eol=lf
+*.project text eol=lf
+*.cproject text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+Makefile text eol=lf
+
+# Markdown/docs
+*.md text eol=lf
+*.txt text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+*.zip binary
+*.elf binary
+*.bin binary
+*.hex binary
