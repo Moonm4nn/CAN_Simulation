@@ -18,13 +18,14 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include <stdint.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "can_protocol.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,6 +36,7 @@ typedef struct {
   uint8_t fan_req;          // 0/1 (stub for later CAN)
 
   float rpm;
+  float speed_kph;
   float tempC;
   float voltage;
 
@@ -56,6 +58,8 @@ typedef struct {
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 
+CAN_HandleTypeDef hcan1;
+
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
@@ -65,8 +69,9 @@ UART_HandleTypeDef huart2;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_CAN1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -79,6 +84,7 @@ static PowertrainState pt = {
   .torque_limit_pct = 100.0f,
   .fan_req = 0,
   .rpm = 800.0f,
+  .speed_kph = 0.0f,
   .tempC = 35.0f,
   .voltage = 12.6f
 };
@@ -117,6 +123,11 @@ static void pt_update_model(PowertrainState* s, float dt_s) {
   float alpha_rpm  = 1.0f - expf(-dt_s / RPM_TAU);
   s->rpm += alpha_rpm * (rpm_target - s->rpm);
 
+  // Speed math
+  float speed_target = eff * 120.0f;   // simple simulated max speed
+  float alpha_speed  = 1.0f - expf(-dt_s / 0.4f);
+  s->speed_kph += alpha_speed * (speed_target - s->speed_kph);
+
   // Temperature (rise with load, cool to ambient; fan speeds cooling)
   float heat_in = HEAT_K * s->rpm * (0.3f + 0.7f * eff);
   float cool_k  = s->fan_req ? COOL_FAN : COOL_K;
@@ -131,11 +142,11 @@ static void pt_update_model(PowertrainState* s, float dt_s) {
   s->limited  = (s->torque_limit_pct < 99.5f) ? 1 : 0;
 }
 
-static void uart_debug_print(const PowertrainState* s, uint32_t raw_adc, uint32_t pct_inst) {
+static void uart_debug_print(const PowertrainState* s, uint32_t raw_adc, uint32_t pct_inst, uint32_t canTxOk, uint32_t canTxFail) {
   // If you don't want UART spam, increase the print interval in the loop.
   char buf[160];
   int n = snprintf(buf, sizeof(buf),
-                   "ADC=%lu thr=%lu%%(inst) thr=%.1f%%(sm) lim=%.0f%% rpm=%.0f temp=%.1fC V=%.2f OT=%d FAN=%d\r\n",
+                   "ADC=%lu thr=%lu%%(inst) thr=%.1f%%(sm) lim=%.0f%% rpm=%.0f temp=%.1fC V=%.2f OT=%d FAN=%d CAN_OK=%lu CAN_FAIL=%lu\r\n",
                    (unsigned long)raw_adc,
                    (unsigned long)pct_inst,
                    s->throttle_pct,
@@ -144,7 +155,10 @@ static void uart_debug_print(const PowertrainState* s, uint32_t raw_adc, uint32_
                    s->tempC,
                    s->voltage,
                    s->overtemp,
-                   s->fan_req);
+                   s->fan_req,
+                   (unsigned long)canTxOk,
+                   (unsigned long)canTxFail
+                  );
   if (n > 0) {
     HAL_UART_Transmit(&huart2, (uint8_t*)buf, (uint16_t)n, 50);
   }
@@ -180,8 +194,9 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_USART2_UART_Init();
   MX_ADC1_Init();
+  MX_USART2_UART_Init();
+  MX_CAN1_Init();
   /* USER CODE BEGIN 2 */
   
   uint32_t accValue   = 0;
@@ -192,6 +207,22 @@ int main(void)
   uint32_t lastModelMs = 0;
   uint32_t lastLedMs   = 0;
   uint32_t lastUartMs  = 0;
+
+  // CAN Scheduling
+  uint32_t lastThrottleCanMs = 0;
+  uint32_t lastEngineCanMs   = 0;
+  uint32_t lastFaultCanMs    = 0;
+
+  const uint32_t CAN_THROTTLE_PERIOD_MS = 50;
+  const uint32_t CAN_ENGINE_PERIOD_MS   = 100;
+  const uint32_t CAN_FAULT_PERIOD_MS    = 500;
+
+  uint32_t canTxOk = 0;
+  uint32_t canTxFail = 0;
+
+  if (HAL_CAN_Start(&hcan1) != HAL_OK) {
+    Error_Handler();
+  }
 
   // tuning
   const uint32_t SENSE_PERIOD_MS = 10;   // read pot @ 100 Hz
@@ -238,6 +269,63 @@ int main(void)
       lastModelMs = now;
       pt_update_model(&pt, 0.010f); // 10ms timestep
     }
+    
+    // CAN transmit
+    // 2.5) Send throttle status over CAN
+  if (now - lastThrottleCanMs >= CAN_THROTTLE_PERIOD_MS) {
+    lastThrottleCanMs = now;
+
+    uint8_t throttle_send = (uint8_t)clampf(pt.throttle_pct, 0.0f, 100.0f);
+    uint16_t rpm_send     = (uint16_t)clampf(pt.rpm, 0.0f, 6500.0f);
+    uint16_t speed_send   = (uint16_t)clampf(pt.speed_kph, 0.0f, 250.0f);
+    
+    if (CAN_Protocol_SendThrottleStatus(&hcan1, throttle_send, rpm_send, speed_send) == HAL_OK) {
+      canTxOk++;
+    } else {
+      canTxFail++;
+    }
+
+    if (CAN_Protocol_SendThrottleStatus(
+          &hcan1,
+          throttle_send,
+          rpm_send,
+          speed_send
+        ) != HAL_OK) {
+      // Optional: handle TX error later
+    }
+  }
+
+  // 2.6) Send engine status over CAN
+  if (now - lastEngineCanMs >= CAN_ENGINE_PERIOD_MS) {
+    lastEngineCanMs = now;
+
+    uint16_t rpm_send   = (uint16_t)clampf(pt.rpm, 0.0f, 6500.0f);
+    uint16_t speed_send = (uint16_t)clampf(pt.speed_kph, 0.0f, 250.0f);
+    uint8_t temp_send   = (uint8_t)clampf(pt.tempC, 0.0f, 255.0f);
+
+    if (CAN_Protocol_SendEngineStatus(
+          &hcan1,
+          rpm_send,
+          speed_send,
+          temp_send,
+          pt.overtemp
+        ) != HAL_OK) {
+      // Optional: handle TX error later
+    }
+  }
+  
+
+  // 2.7) Send fault status only if active
+  if (pt.overtemp && (now - lastFaultCanMs >= CAN_FAULT_PERIOD_MS)) {
+    lastFaultCanMs = now;
+
+    CAN_Protocol_SendFaultStatus(
+        &hcan1,
+        1,  // source_node: Node A
+        1,  // fault_code: overtemperature
+        1   // fault_active
+    );
+  }
 
     // 3) Heartbeat LED (non-blocking, no HAL_Delay)
     if (now - lastLedMs >= LED_PERIOD_MS) {
@@ -248,7 +336,7 @@ int main(void)
     // 4) UART debug prints (optional but useful)
     if (now - lastUartMs >= UART_PERIOD_MS) {
       lastUartMs = now;
-      uart_debug_print(&pt, accValue, accPercent);
+      uart_debug_print(&pt, accValue, accPercent, canTxOk, canTxFail);
     }
     /* USER CODE END WHILE */
 
@@ -353,6 +441,43 @@ static void MX_ADC1_Init(void)
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief CAN1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CAN1_Init(void)
+{
+
+  /* USER CODE BEGIN CAN1_Init 0 */
+
+  /* USER CODE END CAN1_Init 0 */
+
+  /* USER CODE BEGIN CAN1_Init 1 */
+
+  /* USER CODE END CAN1_Init 1 */
+  hcan1.Instance = CAN1;
+  hcan1.Init.Prescaler = 6;
+  hcan1.Init.Mode = CAN_MODE_LOOPBACK;
+  hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
+  hcan1.Init.TimeSeg1 = CAN_BS1_11TQ;
+  hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
+  hcan1.Init.TimeTriggeredMode = DISABLE;
+  hcan1.Init.AutoBusOff = DISABLE;
+  hcan1.Init.AutoWakeUp = DISABLE;
+  hcan1.Init.AutoRetransmission = DISABLE;
+  hcan1.Init.ReceiveFifoLocked = DISABLE;
+  hcan1.Init.TransmitFifoPriority = DISABLE;
+  if (HAL_CAN_Init(&hcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CAN1_Init 2 */
+
+  /* USER CODE END CAN1_Init 2 */
 
 }
 
