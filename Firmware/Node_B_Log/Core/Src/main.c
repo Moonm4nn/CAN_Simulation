@@ -21,7 +21,11 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "can_protocol.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -47,7 +51,13 @@ CAN_HandleTypeDef hcan1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+volatile uint32_t canRxCount = 0;
+volatile uint32_t canRxDecodeOk = 0;
+volatile uint32_t canRxDecodeFail = 0;
+volatile uint32_t canRxFifoReadFail = 0;
 
+volatile uint8_t newCanMessageFlag = 0;
+volatile CAN_DecodedMessage_t lastDecodedMsg;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -57,7 +67,9 @@ static void MX_ADC1_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_CAN1_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void CAN_Filter_Config(void);
+static void dashboard_print_message(const CAN_DecodedMessage_t *msg);
+static void dashboard_print_status(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -73,7 +85,27 @@ uint8_t RxData[8];
 uint8_t count = 0;
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
-  count++;
+  CAN_RxHeaderTypeDef rxHeader;
+  uint8_t rxData[8];
+  CAN_DecodedMessage_t decoded;
+
+  if (hcan->Instance != CAN1) {
+    return;
+  }
+
+  if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK) {
+    canRxCount++;
+
+    if (CAN_Protocol_Decode(&rxHeader, rxData, &decoded)) {
+      lastDecodedMsg = decoded;
+      newCanMessageFlag = 1;
+      canRxDecodeOk++;
+    } else {
+      canRxDecodeFail++;
+    }
+  } else {
+    canRxFifoReadFail++;
+  }
 }
 /* USER CODE END 0 */
 
@@ -111,18 +143,18 @@ int main(void)
   MX_CAN1_Init();
   /* USER CODE BEGIN 2 */
 
-  HAL_CAN_Start(&hcan);
-  HAL_CAN_ActivatNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
+  CAN_Filter_Config();
 
-  TxHeader.DLC = 1;
-  TxHeader.ExtId = 0;
-  TxHeader.IDE = CAN_ID_STD;
-  TxHeader.RTR = CAN_RTR_DATA;
-  TxHeader.StdId = 0x103;
-  TxHeader.TransmitGlobalTime = DISABLE;
+  if (HAL_CAN_Start(&hcan1) != HAL_OK) {
+    Error_Handler();
+  }
 
-  TxData[0] = 0xf3;
-  HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox);
+  if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) {
+    Error_Handler();
+  }
+
+  uint32_t lastStatusPrintMs = 0;
+  uint32_t lastHeartbeatMs = 0;
   
 
   /* USER CODE END 2 */
@@ -131,6 +163,28 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    uint32_t now = HAL_GetTick();
+
+    if (newCanMessageFlag) {
+      CAN_DecodedMessage_t msgCopy;
+
+      __disable_irq();
+      msgCopy = lastDecodedMsg;
+      newCanMessageFlag = 0;
+      __enable_irq();
+
+      dashboard_print_message(&msgCopy);
+    }
+
+    if (now - lastStatusPrintMs >= 1000) {
+      lastStatusPrintMs = now;
+      dashboard_print_status();
+    }
+
+    if (now - lastHeartbeatMs >= 500) {
+      lastHeartbeatMs = now;
+      HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -273,7 +327,7 @@ static void MX_CAN1_Init(void)
 
   canfilterconfig.FilterActivation = CAN_FILTER_ENABLE;
   canfilterconfig.FilterBank = 10;
-  canfilterconfig.FilterFIFOAssignment = CAN_RX_FIFO;
+  canfilterconfig.FilterFIFOAssignment = CAN_RX_FIFO0;
   canfilterconfig.FilterIdHigh = 0;
   canfilterconfig.FilterIdLow = 0x0000;
   canfilterconfig.FilterMaskIdHigh = 0;
@@ -358,7 +412,95 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+static void CAN_Filter_Config(void)
+{
+  CAN_FilterTypeDef canfilterconfig;
 
+  canfilterconfig.FilterActivation = CAN_FILTER_ENABLE;
+  canfilterconfig.FilterBank = 0;
+  canfilterconfig.FilterFIFOAssignment = CAN_RX_FIFO0;
+  canfilterconfig.FilterIdHigh = 0x0000;
+  canfilterconfig.FilterIdLow = 0x0000;
+  canfilterconfig.FilterMaskIdHigh = 0x0000;
+  canfilterconfig.FilterMaskIdLow = 0x0000;
+  canfilterconfig.FilterMode = CAN_FILTERMODE_IDMASK;
+  canfilterconfig.FilterScale = CAN_FILTERSCALE_32BIT;
+  canfilterconfig.SlaveStartFilterBank = 14;
+
+  if (HAL_CAN_ConfigFilter(&hcan1, &canfilterconfig) != HAL_OK) {
+    Error_Handler();
+  }
+}
+
+static void dashboard_print_message(const CAN_DecodedMessage_t *msg)
+{
+  char buf[160];
+  int n = 0;
+
+  if (msg == NULL) {
+    return;
+  }
+
+  switch (msg->type) {
+    case CAN_MSG_THROTTLE_STATUS:
+      n = snprintf(buf, sizeof(buf),
+                   "RX THROTTLE: thr=%u%% rpm=%u speed=%u kph\r\n",
+                   msg->data.throttle.throttle_percent,
+                   msg->data.throttle.rpm,
+                   msg->data.throttle.speed_kph);
+      break;
+
+    case CAN_MSG_ENGINE_STATUS:
+      n = snprintf(buf, sizeof(buf),
+                   "RX ENGINE: rpm=%u speed=%u kph temp=%uC fault=%u\r\n",
+                   msg->data.engine.rpm,
+                   msg->data.engine.speed_kph,
+                   msg->data.engine.engine_temp_c,
+                   msg->data.engine.engine_fault);
+      break;
+
+    case CAN_MSG_BRAKE_STATUS:
+      n = snprintf(buf, sizeof(buf),
+                   "RX BRAKE: active=%u pressure=%u%% light=%u fault=%u\r\n",
+                   msg->data.brake.brake_active,
+                   msg->data.brake.brake_pressure,
+                   msg->data.brake.brake_light,
+                   msg->data.brake.brake_fault);
+      break;
+
+    case CAN_MSG_FAULT_STATUS:
+      n = snprintf(buf, sizeof(buf),
+                   "RX FAULT: source=%u code=%u active=%u\r\n",
+                   msg->data.fault.source_node,
+                   msg->data.fault.fault_code,
+                   msg->data.fault.fault_active);
+      break;
+
+    default:
+      n = snprintf(buf, sizeof(buf), "RX UNKNOWN\r\n");
+      break;
+  }
+
+  if (n > 0) {
+    HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, 50);
+  }
+}
+
+static void dashboard_print_status(void)
+{
+  char buf[160];
+
+  int n = snprintf(buf, sizeof(buf),
+                   "NODE_B STATUS: RX=%lu DECODE_OK=%lu DECODE_FAIL=%lu FIFO_FAIL=%lu\r\n",
+                   (unsigned long)canRxCount,
+                   (unsigned long)canRxDecodeOk,
+                   (unsigned long)canRxDecodeFail,
+                   (unsigned long)canRxFifoReadFail);
+
+  if (n > 0) {
+    HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, 50);
+  }
+}
 /* USER CODE END 4 */
 
 /**

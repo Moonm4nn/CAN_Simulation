@@ -21,7 +21,11 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "can_protocol.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -47,22 +51,78 @@ CAN_HandleTypeDef hcan1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+uint32_t canTxOk = 0;
+uint32_t canTxFail = 0;
 
+uint32_t adcRaw = 0;
+uint8_t brakePressureInst = 0;
+float brakePressureSmoothed = 0.0f;
+
+uint8_t brakeActive = 0;
+uint8_t brakeLight = 0;
+uint8_t brakeFault = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_ADC1_Init(void);
-static void MX_USART2_UART_Init(void);
 static void MX_CAN1_Init(void);
+static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
+static uint8_t adc_to_pct(uint32_t adc_raw);
+static float clampf(float x, float lo, float hi);
+static void uart_brake_debug_print(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static float clampf(float x, float lo, float hi)
+{
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
 
+static uint8_t adc_to_pct(uint32_t adc_raw)
+{
+  if (adc_raw > 4095U) {
+    adc_raw = 4095U;
+  }
+
+  uint32_t pct = (adc_raw * 100U) / 4095U;
+
+  // Small deadband near 0 to avoid jitter
+  if (pct < 3U) {
+    pct = 0U;
+  }
+
+  if (pct > 100U) {
+    pct = 100U;
+  }
+
+  return (uint8_t)pct;
+}
+
+static void uart_brake_debug_print(void)
+{
+  char buf[180];
+
+  int n = snprintf(buf, sizeof(buf),
+                   "NODE_C BRAKE: ADC=%lu pressure=%u%% sm=%.1f%% active=%u light=%u fault=%u CAN_OK=%lu CAN_FAIL=%lu\r\n",
+                   (unsigned long)adcRaw,
+                   brakePressureInst,
+                   brakePressureSmoothed,
+                   brakeActive,
+                   brakeLight,
+                   brakeFault,
+                   (unsigned long)canTxOk,
+                   (unsigned long)canTxFail);
+
+  if (n > 0) {
+    HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, 50);
+  }
+}
 /* USER CODE END 0 */
 
 /**
@@ -95,16 +155,92 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_ADC1_Init();
-  MX_USART2_UART_Init();
   MX_CAN1_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+  if (HAL_CAN_Start(&hcan1) != HAL_OK) {
+    Error_Handler();
+  }
 
+  uint32_t lastSenseMs = 0;
+  uint32_t lastCanTxMs = 0;
+  uint32_t lastUartMs = 0;
+  uint32_t lastLedMs = 0;
+
+  const uint32_t SENSE_PERIOD_MS = 10;
+  const uint32_t CAN_BRAKE_PERIOD_MS = 50;
+  const uint32_t UART_PERIOD_MS = 200;
+  const uint32_t LED_PERIOD_MS = 500;
+
+  const float BRAKE_ALPHA = 0.15f;
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    uint32_t now = HAL_GetTick();
+
+    // 1. Read brake pressure potentiometer and brake button
+    if (now - lastSenseMs >= SENSE_PERIOD_MS) {
+      lastSenseMs = now;
+
+      if (HAL_ADC_Start(&hadc1) == HAL_OK) {
+        if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
+          adcRaw = HAL_ADC_GetValue(&hadc1);
+          brakePressureInst = adc_to_pct(adcRaw);
+
+          brakePressureSmoothed =
+              (1.0f - BRAKE_ALPHA) * brakePressureSmoothed +
+              BRAKE_ALPHA * (float)brakePressureInst;
+        }
+
+        HAL_ADC_Stop(&hadc1);
+      }
+
+      /*
+       * On many Nucleo boards:
+       * Button released = GPIO_PIN_SET
+       * Button pressed  = GPIO_PIN_RESET
+       */
+      brakeActive = (HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) == GPIO_PIN_RESET) ? 1 : 0;
+
+      brakeLight = brakeActive;
+      brakeFault = 0;
+    }
+
+    // 2. Send brake status over CAN
+    if (now - lastCanTxMs >= CAN_BRAKE_PERIOD_MS) {
+      lastCanTxMs = now;
+
+      uint8_t pressureSend = brakeActive
+                             ? (uint8_t)clampf(brakePressureSmoothed, 0.0f, 100.0f)
+                             : 0;
+
+      if (CAN_Protocol_SendBrakeStatus(
+            &hcan1,
+            brakeActive,
+            pressureSend,
+            brakeLight,
+            brakeFault
+          ) == HAL_OK) {
+        canTxOk++;
+      } else {
+        canTxFail++;
+      }
+    }
+
+    // 3. UART debug print
+    if (now - lastUartMs >= UART_PERIOD_MS) {
+      lastUartMs = now;
+      uart_brake_debug_print();
+    }
+
+    // 4. Heartbeat LED
+    if (now - lastLedMs >= LED_PERIOD_MS) {
+      lastLedMs = now;
+      HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -227,11 +363,11 @@ static void MX_CAN1_Init(void)
 
   /* USER CODE END CAN1_Init 1 */
   hcan1.Instance = CAN1;
-  hcan1.Init.Prescaler = 16;
-  hcan1.Init.Mode = CAN_MODE_LOOPBACK;
+  hcan1.Init.Prescaler = 6;
+  hcan1.Init.Mode = CAN_MODE_NORMAL;
   hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
-  hcan1.Init.TimeSeg1 = CAN_BS1_16TQ;
-  hcan1.Init.TimeSeg2 = CAN_BS2_8TQ;
+  hcan1.Init.TimeSeg1 = CAN_BS1_11TQ;
+  hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
   hcan1.Init.TimeTriggeredMode = DISABLE;
   hcan1.Init.AutoBusOff = DISABLE;
   hcan1.Init.AutoWakeUp = DISABLE;
@@ -304,8 +440,8 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
-  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : LD2_Pin */
