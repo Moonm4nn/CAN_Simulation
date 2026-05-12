@@ -240,7 +240,7 @@ int main(void)
   {
     uint32_t now = HAL_GetTick();
 
-    // 1) Read throttle potentiometer periodically
+    // Read throttle potentiometer periodically
     if (now - lastSenseMs >= SENSE_PERIOD_MS) {
       lastSenseMs = now;
 
@@ -256,22 +256,22 @@ int main(void)
         HAL_ADC_Stop(&hadc1);
       }
 
-      // Stub "commands" (later these come from CAN Node B):
+      // Stub "commands" (to be received from node B):
       // Fan requested if temp rising high
       pt.fan_req = (pt.tempC > 90.0f) ? 1 : 0;
 
-      // Torque limit if overtemp (demo limp mode)
+      // Torque limit if overtemp 
       pt.torque_limit_pct = (pt.tempC > 100.0f) ? 60.0f : 100.0f;
     }
 
-    // 2) Update powertrain model periodically
+    // Update powertrain model periodically
     if (now - lastModelMs >= MODEL_PERIOD_MS) {
       lastModelMs = now;
       pt_update_model(&pt, 0.010f); // 10ms timestep
     }
     
     // CAN transmit
-    // 2.5) Send throttle status over CAN
+    // Send throttle status over CAN
   if (now - lastThrottleCanMs >= CAN_THROTTLE_PERIOD_MS) {
     lastThrottleCanMs = now;
 
@@ -279,19 +279,14 @@ int main(void)
     uint16_t rpm_send     = (uint16_t)clampf(pt.rpm, 0.0f, 6500.0f);
     uint16_t speed_send   = (uint16_t)clampf(pt.speed_kph, 0.0f, 250.0f);
     
-    if (CAN_Protocol_SendThrottleStatus(&hcan1, throttle_send, rpm_send, speed_send) == HAL_OK) {
+    if (CAN_Protocol_SendThrottleStatus(
+      &hcan1, throttle_send, 
+      rpm_send, 
+      speed_send) == HAL_OK) {
       canTxOk++;
     } else {
+      // Fail Handler
       canTxFail++;
-    }
-
-    if (CAN_Protocol_SendThrottleStatus(
-          &hcan1,
-          throttle_send,
-          rpm_send,
-          speed_send
-        ) != HAL_OK) {
-      // Optional: handle TX error later
     }
   }
 
@@ -304,36 +299,43 @@ int main(void)
     uint8_t temp_send   = (uint8_t)clampf(pt.tempC, 0.0f, 255.0f);
 
     if (CAN_Protocol_SendEngineStatus(
-          &hcan1,
-          rpm_send,
-          speed_send,
-          temp_send,
-          pt.overtemp
-        ) != HAL_OK) {
-      // Optional: handle TX error later
+      &hcan1,
+      rpm_send,
+      speed_send,
+      temp_send,
+      pt.overtemp
+      ) == HAL_OK) {
+      canTxOk++;
+    }else{
+      // fail handler
+      canTxFail++;
     }
   }
   
 
-  // 2.7) Send fault status only if active
+  //Send fault status only if active
   if (pt.overtemp && (now - lastFaultCanMs >= CAN_FAULT_PERIOD_MS)) {
     lastFaultCanMs = now;
-
-    CAN_Protocol_SendFaultStatus(
-        &hcan1,
-        1,  // source_node: Node A
-        1,  // fault_code: overtemperature
-        1   // fault_active
-    );
+    
+    if (CAN_Protocol_SendFaultStatus(
+      &hcan1,
+      1,  // source_node: Node A
+      1,  // fault_code: overtemperature
+      1   // fault_active
+    ) == HAL_OK){
+      canTxOk++;
+    }else{
+      canTxFail++;
+    }
   }
 
-    // 3) Heartbeat LED (non-blocking, no HAL_Delay)
+    // Heartbeat LED (non-blocking, no HAL_Delay)
     if (now - lastLedMs >= LED_PERIOD_MS) {
       lastLedMs = now;
       HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
     }
 
-    // 4) UART debug prints (optional but useful)
+    // UART debug prints
     if (now - lastUartMs >= UART_PERIOD_MS) {
       lastUartMs = now;
       uart_debug_print(&pt, accValue, accPercent, canTxOk, canTxFail);
@@ -468,7 +470,7 @@ static void MX_CAN1_Init(void)
   hcan1.Init.TimeTriggeredMode = DISABLE;
   hcan1.Init.AutoBusOff = DISABLE;
   hcan1.Init.AutoWakeUp = DISABLE;
-  hcan1.Init.AutoRetransmission = DISABLE;
+  hcan1.Init.AutoRetransmission = ENABLE;
   hcan1.Init.ReceiveFifoLocked = DISABLE;
   hcan1.Init.TransmitFifoPriority = DISABLE;
   if (HAL_CAN_Init(&hcan1) != HAL_OK)

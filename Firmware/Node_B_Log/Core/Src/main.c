@@ -56,6 +56,27 @@ volatile uint32_t canRxDecodeOk = 0;
 volatile uint32_t canRxDecodeFail = 0;
 volatile uint32_t canRxFifoReadFail = 0;
 
+volatile uint32_t canWindowRxCount = 0;
+volatile uint32_t canWindowDecodeOk = 0;
+volatile uint32_t canWindowDecodeFail = 0;
+volatile uint32_t canWindowFifoReadFail = 0;
+
+volatile uint32_t canWindowThrottleCount = 0;
+volatile uint32_t canWindowEngineCount = 0;
+volatile uint32_t canWindowBrakeCount = 0;
+volatile uint32_t canWindowFaultCount = 0;
+volatile uint32_t canWindowUnknownCount = 0;
+
+volatile uint8_t canWindowHasThrottle = 0;
+volatile uint8_t canWindowHasEngine = 0;
+volatile uint8_t canWindowHasBrake = 0;
+volatile uint8_t canWindowHasFault = 0;
+
+volatile CAN_DecodedMessage_t canWindowLastThrottleMsg;
+volatile CAN_DecodedMessage_t canWindowLastEngineMsg;
+volatile CAN_DecodedMessage_t canWindowLastBrakeMsg;
+volatile CAN_DecodedMessage_t canWindowLastFaultMsg;
+
 volatile uint8_t newCanMessageFlag = 0;
 volatile CAN_DecodedMessage_t lastDecodedMsg;
 /* USER CODE END PV */
@@ -68,21 +89,29 @@ static void MX_USART2_UART_Init(void);
 static void MX_CAN1_Init(void);
 /* USER CODE BEGIN PFP */
 static void CAN_Filter_Config(void);
-static void dashboard_print_message(const CAN_DecodedMessage_t *msg);
-static void dashboard_print_status(void);
+static void dashboard_print_status(uint32_t windowMs,
+                                   uint32_t windowRxCount,
+                                   uint32_t windowDecodeOk,
+                                   uint32_t windowDecodeFail,
+                                   uint32_t windowFifoFail,
+                                   uint32_t throttleCount,
+                                   uint32_t engineCount,
+                                   uint32_t brakeCount,
+                                   uint32_t faultCount,
+                                   uint32_t unknownCount,
+                                   const CAN_DecodedMessage_t *throttleMsg,
+                                   const CAN_DecodedMessage_t *engineMsg,
+                                   const CAN_DecodedMessage_t *brakeMsg,
+                                   const CAN_DecodedMessage_t *faultMsg,
+                                   uint8_t hasThrottle,
+                                   uint8_t hasEngine,
+                                   uint8_t hasBrake,
+                                   uint8_t hasFault);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-CAN_TxHeaderTypeDef TxHeader;
-CAN_RxHeaderTypeDef RxHeader;
 
-uint32_t TxMailbox;
-
-uint8_t TxData[8];
-uint8_t RxData[8];
-
-uint8_t count = 0;
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
   CAN_RxHeaderTypeDef rxHeader;
@@ -95,16 +124,48 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 
   if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK) {
     canRxCount++;
+    canWindowRxCount++;
 
     if (CAN_Protocol_Decode(&rxHeader, rxData, &decoded)) {
-      lastDecodedMsg = decoded;
-      newCanMessageFlag = 1;
       canRxDecodeOk++;
+      canWindowDecodeOk++;
+
+      switch (decoded.type) {
+        case CAN_MSG_THROTTLE_STATUS:
+          canWindowThrottleCount++;
+          canWindowHasThrottle = 1;
+          canWindowLastThrottleMsg = decoded;
+          break;
+
+        case CAN_MSG_ENGINE_STATUS:
+          canWindowEngineCount++;
+          canWindowHasEngine = 1;
+          canWindowLastEngineMsg = decoded;
+          break;
+
+        case CAN_MSG_BRAKE_STATUS:
+          canWindowBrakeCount++;
+          canWindowHasBrake = 1;
+          canWindowLastBrakeMsg = decoded;
+          break;
+
+        case CAN_MSG_FAULT_STATUS:
+          canWindowFaultCount++;
+          canWindowHasFault = 1;
+          canWindowLastFaultMsg = decoded;
+          break;
+
+        default:
+          canWindowUnknownCount++;
+          break;
+      }
     } else {
       canRxDecodeFail++;
+      canWindowDecodeFail++;
     }
   } else {
     canRxFifoReadFail++;
+    canWindowFifoReadFail++;
   }
 }
 /* USER CODE END 0 */
@@ -155,6 +216,7 @@ int main(void)
 
   uint32_t lastStatusPrintMs = 0;
   uint32_t lastHeartbeatMs = 0;
+  const uint32_t statusPrintIntervalMs = 500;
   
 
   /* USER CODE END 2 */
@@ -165,20 +227,79 @@ int main(void)
   {
     uint32_t now = HAL_GetTick();
 
-    if (newCanMessageFlag) {
-      CAN_DecodedMessage_t msgCopy;
+    if (now - lastStatusPrintMs >= statusPrintIntervalMs) {
+      uint32_t windowRxCount;
+      uint32_t windowDecodeOk;
+      uint32_t windowDecodeFail;
+      uint32_t windowFifoFail;
+      uint32_t windowThrottle;
+      uint32_t windowEngine;
+      uint32_t windowBrake;
+      uint32_t windowFault;
+      uint32_t windowUnknown;
+      uint8_t hasThrottle;
+      uint8_t hasEngine;
+      uint8_t hasBrake;
+      uint8_t hasFault;
+      CAN_DecodedMessage_t throttleMsg;
+      CAN_DecodedMessage_t engineMsg;
+      CAN_DecodedMessage_t brakeMsg;
+      CAN_DecodedMessage_t faultMsg;
 
       __disable_irq();
-      msgCopy = lastDecodedMsg;
-      newCanMessageFlag = 0;
+      windowRxCount = canWindowRxCount;
+      windowDecodeOk = canWindowDecodeOk;
+      windowDecodeFail = canWindowDecodeFail;
+      windowFifoFail = canWindowFifoReadFail;
+      windowThrottle = canWindowThrottleCount;
+      windowEngine = canWindowEngineCount;
+      windowBrake = canWindowBrakeCount;
+      windowFault = canWindowFaultCount;
+      windowUnknown = canWindowUnknownCount;
+      hasThrottle = canWindowHasThrottle;
+      hasEngine = canWindowHasEngine;
+      hasBrake = canWindowHasBrake;
+      hasFault = canWindowHasFault;
+
+      throttleMsg = canWindowLastThrottleMsg;
+      engineMsg = canWindowLastEngineMsg;
+      brakeMsg = canWindowLastBrakeMsg;
+      faultMsg = canWindowLastFaultMsg;
+
+      canWindowRxCount = 0;
+      canWindowDecodeOk = 0;
+      canWindowDecodeFail = 0;
+      canWindowFifoReadFail = 0;
+      canWindowThrottleCount = 0;
+      canWindowEngineCount = 0;
+      canWindowBrakeCount = 0;
+      canWindowFaultCount = 0;
+      canWindowUnknownCount = 0;
+      canWindowHasThrottle = 0;
+      canWindowHasEngine = 0;
+      canWindowHasBrake = 0;
+      canWindowHasFault = 0;
       __enable_irq();
 
-      dashboard_print_message(&msgCopy);
-    }
-
-    if (now - lastStatusPrintMs >= 1000) {
       lastStatusPrintMs = now;
-      dashboard_print_status();
+      dashboard_print_status(statusPrintIntervalMs,
+                             windowRxCount,
+                             windowDecodeOk,
+                             windowDecodeFail,
+                             windowFifoFail,
+                             windowThrottle,
+                             windowEngine,
+                             windowBrake,
+                             windowFault,
+                             windowUnknown,
+                             &throttleMsg,
+                             &engineMsg,
+                             &brakeMsg,
+                             &faultMsg,
+                             hasThrottle,
+                             hasEngine,
+                             hasBrake,
+                             hasFault);
     }
 
     if (now - lastHeartbeatMs >= 500) {
@@ -315,7 +436,7 @@ static void MX_CAN1_Init(void)
   hcan1.Init.TimeTriggeredMode = DISABLE;
   hcan1.Init.AutoBusOff = DISABLE;
   hcan1.Init.AutoWakeUp = DISABLE;
-  hcan1.Init.AutoRetransmission = DISABLE;
+  hcan1.Init.AutoRetransmission = ENABLE;
   hcan1.Init.ReceiveFifoLocked = DISABLE;
   hcan1.Init.TransmitFifoPriority = DISABLE;
   if (HAL_CAN_Init(&hcan1) != HAL_OK)
@@ -323,18 +444,7 @@ static void MX_CAN1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN CAN1_Init 2 */
-  CAN_FilterTypeDef canfilterconfig;
-
-  canfilterconfig.FilterActivation = CAN_FILTER_ENABLE;
-  canfilterconfig.FilterBank = 10;
-  canfilterconfig.FilterFIFOAssignment = CAN_RX_FIFO0;
-  canfilterconfig.FilterIdHigh = 0;
-  canfilterconfig.FilterIdLow = 0x0000;
-  canfilterconfig.FilterMaskIdHigh = 0;
-  canfilterconfig.FilterMaskIdLow = 0x0000;
-  canfilterconfig.FilterMode = CAN_FILTERMODE_IDMASK;
-  canfilterconfig.FilterScale = CAN_FILTERSCALE_32BIT;
-  canfilterconfig.SlaveStartFilterBank = 0;
+  
   /* USER CODE END CAN1_Init 2 */
 
 }
@@ -432,73 +542,88 @@ static void CAN_Filter_Config(void)
   }
 }
 
-static void dashboard_print_message(const CAN_DecodedMessage_t *msg)
-{
-  char buf[160];
-  int n = 0;
-
-  if (msg == NULL) {
-    return;
-  }
-
-  switch (msg->type) {
-    case CAN_MSG_THROTTLE_STATUS:
-      n = snprintf(buf, sizeof(buf),
-                   "RX THROTTLE: thr=%u%% rpm=%u speed=%u kph\r\n",
-                   msg->data.throttle.throttle_percent,
-                   msg->data.throttle.rpm,
-                   msg->data.throttle.speed_kph);
-      break;
-
-    case CAN_MSG_ENGINE_STATUS:
-      n = snprintf(buf, sizeof(buf),
-                   "RX ENGINE: rpm=%u speed=%u kph temp=%uC fault=%u\r\n",
-                   msg->data.engine.rpm,
-                   msg->data.engine.speed_kph,
-                   msg->data.engine.engine_temp_c,
-                   msg->data.engine.engine_fault);
-      break;
-
-    case CAN_MSG_BRAKE_STATUS:
-      n = snprintf(buf, sizeof(buf),
-                   "RX BRAKE: active=%u pressure=%u%% light=%u fault=%u\r\n",
-                   msg->data.brake.brake_active,
-                   msg->data.brake.brake_pressure,
-                   msg->data.brake.brake_light,
-                   msg->data.brake.brake_fault);
-      break;
-
-    case CAN_MSG_FAULT_STATUS:
-      n = snprintf(buf, sizeof(buf),
-                   "RX FAULT: source=%u code=%u active=%u\r\n",
-                   msg->data.fault.source_node,
-                   msg->data.fault.fault_code,
-                   msg->data.fault.fault_active);
-      break;
-
-    default:
-      n = snprintf(buf, sizeof(buf), "RX UNKNOWN\r\n");
-      break;
-  }
-
-  if (n > 0) {
-    HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, 50);
-  }
-}
-
-static void dashboard_print_status(void)
+static void dashboard_print_status(uint32_t windowMs,
+                                   uint32_t windowRxCount,
+                                   uint32_t windowDecodeOk,
+                                   uint32_t windowDecodeFail,
+                                   uint32_t windowFifoFail,
+                                   uint32_t throttleCount,
+                                   uint32_t engineCount,
+                                   uint32_t brakeCount,
+                                   uint32_t faultCount,
+                                   uint32_t unknownCount,
+                                   const CAN_DecodedMessage_t *throttleMsg,
+                                   const CAN_DecodedMessage_t *engineMsg,
+                                   const CAN_DecodedMessage_t *brakeMsg,
+                                   const CAN_DecodedMessage_t *faultMsg,
+                                   uint8_t hasThrottle,
+                                   uint8_t hasEngine,
+                                   uint8_t hasBrake,
+                                   uint8_t hasFault)
 {
   char buf[160];
 
   int n = snprintf(buf, sizeof(buf),
-                   "NODE_B STATUS: RX=%lu DECODE_OK=%lu DECODE_FAIL=%lu FIFO_FAIL=%lu\r\n",
-                   (unsigned long)canRxCount,
-                   (unsigned long)canRxDecodeOk,
-                   (unsigned long)canRxDecodeFail,
-                   (unsigned long)canRxFifoReadFail);
+                   "NODE_B %lums: RX=%lu OK=%lu FAIL=%lu FIFO=%lu THR=%lu ENG=%lu BRK=%lu FLT=%lu UNK=%lu\r\n",
+                   (unsigned long)windowMs,
+                   (unsigned long)windowRxCount,
+                   (unsigned long)windowDecodeOk,
+                   (unsigned long)windowDecodeFail,
+                   (unsigned long)windowFifoFail,
+                   (unsigned long)throttleCount,
+                   (unsigned long)engineCount,
+                   (unsigned long)brakeCount,
+                   (unsigned long)faultCount,
+                   (unsigned long)unknownCount);
 
   if (n > 0) {
     HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, 50);
+  }
+
+  if (hasThrottle && throttleMsg != NULL) {
+    n = snprintf(buf, sizeof(buf),
+                 "  THROTTLE: thr=%u%% rpm=%u speed=%u kph\r\n",
+                 throttleMsg->data.throttle.throttle_percent,
+                 throttleMsg->data.throttle.rpm,
+                 throttleMsg->data.throttle.speed_kph);
+    if (n > 0) {
+      HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, 50);
+    }
+  }
+
+  if (hasEngine && engineMsg != NULL) {
+    n = snprintf(buf, sizeof(buf),
+                 "  ENGINE: rpm=%u speed=%u kph temp=%uC fault=%u\r\n",
+                 engineMsg->data.engine.rpm,
+                 engineMsg->data.engine.speed_kph,
+                 engineMsg->data.engine.engine_temp_c,
+                 engineMsg->data.engine.engine_fault);
+    if (n > 0) {
+      HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, 50);
+    }
+  }
+
+  if (hasBrake && brakeMsg != NULL) {
+    n = snprintf(buf, sizeof(buf),
+                 "  BRAKE: active=%u pressure=%u%% light=%u fault=%u\r\n",
+                 brakeMsg->data.brake.brake_active,
+                 brakeMsg->data.brake.brake_pressure,
+                 brakeMsg->data.brake.brake_light,
+                 brakeMsg->data.brake.brake_fault);
+    if (n > 0) {
+      HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, 50);
+    }
+  }
+
+  if (hasFault && faultMsg != NULL) {
+    n = snprintf(buf, sizeof(buf),
+                 "  FAULT: source=%u code=%u active=%u\r\n",
+                 faultMsg->data.fault.source_node,
+                 faultMsg->data.fault.fault_code,
+                 faultMsg->data.fault.fault_active);
+    if (n > 0) {
+      HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, 50);
+    }
   }
 }
 /* USER CODE END 4 */
