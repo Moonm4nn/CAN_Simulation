@@ -24,3 +24,6 @@ This project simulates a vehicle CAN network using three STM32 boards.
 - `firmware/node_c_brake/`
 - `shared/`
 - `docs/`
+
+## Notes
+Ended up not directly using te sared folder, instead, the file contenets were copied and pasted into the individual src and inc folders of the different nodes for easier handling with stm32IDE for vscode the shared folder jsut contains the master can_protocol header and c files for copyin into those respective folders those folders need to be identical as they handle data structs, encoding and decoding.
