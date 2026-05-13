@@ -68,6 +68,7 @@ typedef struct
 
 /*
  * Fault status packet
+ * Not fully implemented yet
  */
 typedef struct
 {

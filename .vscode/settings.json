@@ -1,3 +1,7 @@
 {
-    "cmake.sourceDirectory": "C:/Users/munaa/OneDrive/Desktop/ECE692/CAN_simulation/Firmware/Node_C_Brake"
+    "cmake.sourceDirectory": "C:/Users/munaa/OneDrive/Desktop/ECE692/CAN_simulation/Firmware/Node_C_Brake",
+    "cmake.cmakePath": "cube-cmake",
+    "cmake.configureArgs": [
+        "-DCMAKE_COMMAND=cube-cmake"
+    ]
 }

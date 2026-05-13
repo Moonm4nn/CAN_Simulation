@@ -30,7 +30,19 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef struct {
+  float throttle_pct;       // smoothed 0..100
+  float torque_limit_pct;   // 0..100 (stub for later CAN)
+  uint8_t fan_req;          // 0/1 (stub for later CAN)
 
+  float rpm;
+  float speed_kph;
+  float tempC;
+  float voltage;
+
+  uint8_t overtemp;
+  uint8_t limited;
+} PowertrainState;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -51,76 +63,104 @@ CAN_HandleTypeDef hcan1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-uint32_t canTxOk = 0;
-uint32_t canTxFail = 0;
 
-uint32_t adcRaw = 0;
-uint8_t brakePressureInst = 0;
-float brakePressureSmoothed = 0.0f;
-
-uint8_t brakeActive = 0;
-uint8_t brakeLight = 0;
-uint8_t brakeFault = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_ADC1_Init(void);
-static void MX_CAN1_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_CAN1_Init(void);
 /* USER CODE BEGIN PFP */
-static uint8_t adc_to_pct(uint32_t adc_raw);
-static float clampf(float x, float lo, float hi);
-static void uart_brake_debug_print(void);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-static float clampf(float x, float lo, float hi)
-{
+
+static PowertrainState pt = {
+  .throttle_pct = 0.0f,
+  .torque_limit_pct = 100.0f,
+  .fan_req = 0,
+  .rpm = 800.0f,
+  .speed_kph = 0.0f,
+  .tempC = 35.0f,
+  .voltage = 12.6f
+};
+
+static float clampf(float x, float lo, float hi) {
   if (x < lo) return lo;
   if (x > hi) return hi;
   return x;
 }
 
-static uint8_t adc_to_pct(uint32_t adc_raw)
-{
-  if (adc_raw > 4095U) {
-    adc_raw = 4095U;
-  }
-
+static uint8_t adc_to_pct(uint32_t adc_raw) {
+  if (adc_raw > 4095U) adc_raw = 4095U;
   uint32_t pct = (adc_raw * 100U) / 4095U;
-
-  // Small deadband near 0 to avoid jitter
-  if (pct < 3U) {
-    pct = 0U;
-  }
-
-  if (pct > 100U) {
-    pct = 100U;
-  }
-
+  if (pct < 3U) pct = 0U;      // deadband
+  if (pct > 100U) pct = 100U;
   return (uint8_t)pct;
 }
 
-static void uart_brake_debug_print(void)
-{
-  char buf[180];
+static void pt_update_model(PowertrainState* s, float dt_s) {
+  // Constants
+  const float RPM_IDLE = 800.0f;
+  const float RPM_MAX  = 6500.0f;
+  const float TEMP_AMB = 25.0f;
 
+  const float RPM_TAU  = 0.15f;     // seconds (ramp feel)
+  const float HEAT_K   = 0.00002f;  // tune if needed
+  const float COOL_K   = 0.03f;
+  const float COOL_FAN = 0.08f;
+
+  // Apply torque limit
+  float eff = (s->throttle_pct / 100.0f) * (s->torque_limit_pct / 100.0f);
+  eff = clampf(eff, 0.0f, 1.0f);
+
+  // RPM target and ramp
+  float rpm_target = RPM_IDLE + eff * (RPM_MAX - RPM_IDLE);
+  float alpha_rpm  = 1.0f - expf(-dt_s / RPM_TAU);
+  s->rpm += alpha_rpm * (rpm_target - s->rpm);
+
+  // Speed math
+  float speed_target = eff * 120.0f;   // simple simulated max speed
+  float alpha_speed  = 1.0f - expf(-dt_s / 0.4f);
+  s->speed_kph += alpha_speed * (speed_target - s->speed_kph);
+
+  // Temperature (rise with load, cool to ambient; fan speeds cooling)
+  float heat_in = HEAT_K * s->rpm * (0.3f + 0.7f * eff);
+  float cool_k  = s->fan_req ? COOL_FAN : COOL_K;
+  float cool    = cool_k * (s->tempC - TEMP_AMB);
+  s->tempC += (heat_in - cool) * dt_s;
+
+  // Voltage droop with load
+  s->voltage = 12.6f - 0.8f * eff;
+
+  // Status flags
+  s->overtemp = (s->tempC >= 105.0f) ? 1 : 0;
+  s->limited  = (s->torque_limit_pct < 99.5f) ? 1 : 0;
+}
+
+static void uart_debug_print(const PowertrainState* s, uint32_t raw_adc, uint32_t pct_inst, uint32_t canTxOk, uint32_t canTxFail) {
+  // If you don't want UART spam, increase the print interval in the loop.
+  char buf[160];
   int n = snprintf(buf, sizeof(buf),
-                   "NODE_C BRAKE: ADC=%lu pressure=%u%% sm=%.1f%% active=%u light=%u fault=%u CAN_OK=%lu CAN_FAIL=%lu\r\n",
-                   (unsigned long)adcRaw,
-                   brakePressureInst,
-                   brakePressureSmoothed,
-                   brakeActive,
-                   brakeLight,
-                   brakeFault,
+                   "ADC=%lu thr=%lu%%(inst) thr=%.1f%%(sm) lim=%.0f%% rpm=%.0f temp=%.1fC V=%.2f OT=%d FAN=%d CAN_OK=%lu CAN_FAIL=%lu\r\n",
+                   (unsigned long)raw_adc,
+                   (unsigned long)pct_inst,
+                   s->throttle_pct,
+                   s->torque_limit_pct,
+                   s->rpm,
+                   s->tempC,
+                   s->voltage,
+                   s->overtemp,
+                   s->fan_req,
                    (unsigned long)canTxOk,
-                   (unsigned long)canTxFail);
-
+                   (unsigned long)canTxFail
+                  );
   if (n > 0) {
-    HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, 50);
+    HAL_UART_Transmit(&huart2, (uint8_t*)buf, (uint16_t)n, 50);
   }
 }
 /* USER CODE END 0 */
@@ -155,24 +195,43 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_ADC1_Init();
-  MX_CAN1_Init();
   MX_USART2_UART_Init();
+  MX_CAN1_Init();
   /* USER CODE BEGIN 2 */
+  
+  uint32_t accValue   = 0;
+  uint32_t accPercent = 0;
+
+  // scheduling
+  uint32_t lastSenseMs = 0;
+  uint32_t lastModelMs = 0;
+  uint32_t lastLedMs   = 0;
+  uint32_t lastUartMs  = 0;
+
+  // CAN Scheduling
+  uint32_t lastThrottleCanMs = 0;
+  uint32_t lastEngineCanMs   = 0;
+  uint32_t lastFaultCanMs    = 0;
+
+  const uint32_t CAN_THROTTLE_PERIOD_MS = 50;
+  const uint32_t CAN_ENGINE_PERIOD_MS   = 100;
+  const uint32_t CAN_FAULT_PERIOD_MS    = 500;
+
+  uint32_t canTxOk = 0;
+  uint32_t canTxFail = 0;
+
   if (HAL_CAN_Start(&hcan1) != HAL_OK) {
     Error_Handler();
   }
 
-  uint32_t lastSenseMs = 0;
-  uint32_t lastCanTxMs = 0;
-  uint32_t lastUartMs = 0;
-  uint32_t lastLedMs = 0;
+  // tuning
+  const uint32_t SENSE_PERIOD_MS = 10;   // read pot @ 100 Hz
+  const uint32_t MODEL_PERIOD_MS = 10;   // update model @ 100 Hz
+  const uint32_t LED_PERIOD_MS   = 500;  // heartbeat LED
+  const uint32_t UART_PERIOD_MS  = 200;  // debug print rate
 
-  const uint32_t SENSE_PERIOD_MS = 10;
-  const uint32_t CAN_BRAKE_PERIOD_MS = 50;
-  const uint32_t UART_PERIOD_MS = 200;
-  const uint32_t LED_PERIOD_MS = 500;
-
-  const float BRAKE_ALPHA = 0.15f;
+  // throttle smoothing
+  const float THR_ALPHA = 0.15f;         // 0..1 higher = faster response
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -181,65 +240,105 @@ int main(void)
   {
     uint32_t now = HAL_GetTick();
 
-    // Read brake pressure potentiometer and brake button
+    // Read throttle potentiometer periodically
     if (now - lastSenseMs >= SENSE_PERIOD_MS) {
       lastSenseMs = now;
 
       if (HAL_ADC_Start(&hadc1) == HAL_OK) {
         if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
-          adcRaw = HAL_ADC_GetValue(&hadc1);
-          brakePressureInst = adc_to_pct(adcRaw);
+          accValue = HAL_ADC_GetValue(&hadc1);
+          accPercent = (accValue * 100U) / 4095U;   // instantaneous
+          uint8_t pct_db = adc_to_pct(accValue);    // with deadband
 
-          brakePressureSmoothed =
-              (1.0f - BRAKE_ALPHA) * brakePressureSmoothed +
-              BRAKE_ALPHA * (float)brakePressureInst;
+          // Smooth throttle (prevents jitter)
+          pt.throttle_pct = (1.0f - THR_ALPHA) * pt.throttle_pct + THR_ALPHA * (float)pct_db;
         }
-
         HAL_ADC_Stop(&hadc1);
       }
 
-      /*
-       * On many Nucleo boards:
-       * Button released = GPIO_PIN_SET
-       * Button pressed  = GPIO_PIN_RESET
-       */
-      brakeActive = (HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) == GPIO_PIN_RESET) ? 1 : 0;
+      // Stub "commands" (to be received from node B):
+      // Fan requested if temp rising high
+      pt.fan_req = (pt.tempC > 90.0f) ? 1 : 0;
 
-      brakeLight = brakeActive;
-      brakeFault = 0;
+      // Torque limit if overtemp 
+      pt.torque_limit_pct = (pt.tempC > 100.0f) ? 60.0f : 100.0f;
     }
 
-    // Send brake status over CAN
-    if (now - lastCanTxMs >= CAN_BRAKE_PERIOD_MS) {
-      lastCanTxMs = now;
-
-      uint8_t pressureSend = brakeActive
-                             ? (uint8_t)clampf(brakePressureSmoothed, 0.0f, 100.0f)
-                             : 0;
-
-      if (CAN_Protocol_SendBrakeStatus(
-            &hcan1,
-            brakeActive,
-            pressureSend,
-            brakeLight,
-            brakeFault
-          ) == HAL_OK) {
-        canTxOk++;
-      } else {
-        canTxFail++;
-      }
+    // Update powertrain model periodically
+    if (now - lastModelMs >= MODEL_PERIOD_MS) {
+      lastModelMs = now;
+      pt_update_model(&pt, 0.010f); // 10ms timestep
     }
+    
+    // CAN transmit
+    // Send throttle status over CAN
+  if (now - lastThrottleCanMs >= CAN_THROTTLE_PERIOD_MS) {
+    lastThrottleCanMs = now;
 
-    // UART debug print
-    if (now - lastUartMs >= UART_PERIOD_MS) {
-      lastUartMs = now;
-      uart_brake_debug_print();
+    uint8_t throttle_send = (uint8_t)clampf(pt.throttle_pct, 0.0f, 100.0f);
+    uint16_t rpm_send     = (uint16_t)clampf(pt.rpm, 0.0f, 6500.0f);
+    uint16_t speed_send   = (uint16_t)clampf(pt.speed_kph, 0.0f, 250.0f);
+    
+    if (CAN_Protocol_SendThrottleStatus(
+      &hcan1, throttle_send, 
+      rpm_send, 
+      speed_send) == HAL_OK) {
+      canTxOk++;
+    } else {
+      // Fail Handler
+      canTxFail++;
     }
+  }
 
-    // Heartbeat LED
+  // 2.6) Send engine status over CAN
+  if (now - lastEngineCanMs >= CAN_ENGINE_PERIOD_MS) {
+    lastEngineCanMs = now;
+
+    uint16_t rpm_send   = (uint16_t)clampf(pt.rpm, 0.0f, 6500.0f);
+    uint16_t speed_send = (uint16_t)clampf(pt.speed_kph, 0.0f, 250.0f);
+    uint8_t temp_send   = (uint8_t)clampf(pt.tempC, 0.0f, 255.0f);
+
+    if (CAN_Protocol_SendEngineStatus(
+      &hcan1,
+      rpm_send,
+      speed_send,
+      temp_send,
+      pt.overtemp
+      ) == HAL_OK) {
+      canTxOk++;
+    }else{
+      // fail handler
+      canTxFail++;
+    }
+  }
+  
+
+  //Send fault status only if active
+  if (pt.overtemp && (now - lastFaultCanMs >= CAN_FAULT_PERIOD_MS)) {
+    lastFaultCanMs = now;
+    
+    if (CAN_Protocol_SendFaultStatus(
+      &hcan1,
+      1,  // source_node: Node A
+      1,  // fault_code: overtemperature
+      1   // fault_active
+    ) == HAL_OK){
+      canTxOk++;
+    }else{
+      canTxFail++;
+    }
+  }
+
+    // Heartbeat LED (non-blocking, no HAL_Delay)
     if (now - lastLedMs >= LED_PERIOD_MS) {
       lastLedMs = now;
       HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+    }
+
+    // UART debug prints
+    if (now - lastUartMs >= UART_PERIOD_MS) {
+      lastUartMs = now;
+      uart_debug_print(&pt, accValue, accPercent, canTxOk, canTxFail);
     }
     /* USER CODE END WHILE */
 
@@ -364,7 +463,7 @@ static void MX_CAN1_Init(void)
   /* USER CODE END CAN1_Init 1 */
   hcan1.Instance = CAN1;
   hcan1.Init.Prescaler = 6;
-  hcan1.Init.Mode = CAN_MODE_NORMAL;
+  hcan1.Init.Mode = CAN_MODE_LOOPBACK;
   hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
   hcan1.Init.TimeSeg1 = CAN_BS1_11TQ;
   hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
